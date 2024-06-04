@@ -1,6 +1,6 @@
 # Watara Supervision handheld console emulator for Windows
 
-[Watara Supervision handheld console]([https://en.wikipedia.org/wiki/Gamate](https://en.m.wikipedia.org/wiki/Watara_Supervision)) emulator for Windows
+[Watara Supervision](https://en.m.wikipedia.org/wiki/Watara_Supervision) handheld console emulator for Windows
 
 
 running:
@@ -22,5 +22,6 @@ X - B button
 
 # Credits
 
-Based on great documentation by [Kevtris]([http://blog.kevtris.org/blogfiles/Gamate%20Inside.txt](http://blog.kevtris.org/blogfiles/Supervision_Tech.txt)). 
+Based on great documentation by [Kevtris](http://blog.kevtris.org/blogfiles/Supervision_Tech.txt). 
 
+Using awesome M65(C)02 emulator by Marat Fayzullin.
