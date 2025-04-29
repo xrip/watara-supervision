@@ -2,7 +2,7 @@
 #define SOUND_H
 
 #define UNSCALED_CLOCK 4000000
-#define SV_SAMPLE_RATE 44100
+#define SAMPLE_RATE 44100
 
 // Define duty cycles as percentages of the waveform period
 typedef enum {
@@ -16,7 +16,6 @@ typedef enum {
 typedef struct {
     // Registers
     uint8_t reg[4]; // Raw register values
-    uint16_t period; // Period value from registers 0-1
     uint8_t duty; // Duty cycle (0-3)
     uint8_t volume; // Volume level (0-15)
     uint16_t length; // Length counter from register 3
@@ -53,12 +52,11 @@ inline void sound_wave_write(int channel_index, int reg_index, uint8_t value) {
         case 0:
         case 1: {
             // Update period from registers 0 and 1
-            uint16_t period_value = channel->reg[0] | ((channel->reg[1] & 0x07) << 8);
-            channel->period = period_value;
+            const uint16_t period_value = channel->reg[0] | (channel->reg[1] & 0x07) << 8;
 
             // Calculate size (samples per waveform) based on period
             // Size = (SampleRate * Period * 32) / ClockRate
-            channel->size = (uint16_t) ((uint32_t) SV_SAMPLE_RATE * ((period_value + 1) << 5) / UNSCALED_CLOCK);
+            channel->size = (uint16_t) ((uint32_t) SAMPLE_RATE * ((period_value + 1) << 5) / UNSCALED_CLOCK);
 
             // Reset position at period change to avoid clicks
             channel->position = 0;
