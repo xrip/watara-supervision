@@ -134,7 +134,7 @@ inline int16_t sound_generate_sample() {
     // if (output > 127) output = 127;
     // if (output < -128) output = -128;
 
-    return output << 8;
+    return (int16_t)( output << 8);
 }
 
 #endif //SOUND_H
