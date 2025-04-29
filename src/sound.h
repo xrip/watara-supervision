@@ -40,7 +40,7 @@ inline void sound_reset() {
 }
 
 // Register write handler for square wave channels
-inline void sound_wave_write(int channel_index, int reg_index, uint8_t value) {
+inline void sound_wave_write(const int channel_index, const int reg_index, const uint8_t value) {
     if (channel_index < 0 || channel_index > 1 || reg_index < 0 || reg_index > 3) {
         return; // Invalid parameters
     }
