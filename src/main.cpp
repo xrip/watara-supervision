@@ -7,6 +7,7 @@
 
 #include "MiniFB.h"
 #include "m6502/m6502.h"
+#include "sound.h"
 
 static M6502 cpu;
 
@@ -31,6 +32,8 @@ static uint8_t *key_status = (uint8_t *) mfb_keystatus();
 size_t rom_size;
 
 static uint8_t irq_timer_counter = 0;
+static uint8_t irq_timer_expired = true;
+
 static uint8_t irq_enabled = true;
 static uint8_t nmi_enabled = true;
 static uint16_t timer_prescaler = 256;
@@ -55,6 +58,101 @@ static inline void readfile(const char *pathname, uint8_t *dst) {
     fclose(file);
 }
 
+#define SOUND_FREQUENCY 44100
+
+#define AUDIO_BUFFER_LENGTH ((SOUND_FREQUENCY / 10))
+static int16_t audio_buffer[AUDIO_BUFFER_LENGTH * 2] = { 0 };
+static int sample_index = 0;
+HANDLE updateEvent;
+
+DWORD WINAPI SoundThread(LPVOID lpParam) {
+
+    WAVEHDR waveHeaders[4];
+
+    WAVEFORMATEX format = {0};
+    format.wFormatTag = WAVE_FORMAT_PCM;
+    format.nChannels = 2;
+    format.nSamplesPerSec = SOUND_FREQUENCY;
+    format.wBitsPerSample = 16;
+    format.nBlockAlign = format.nChannels * format.wBitsPerSample / 8;
+    format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
+
+    HANDLE waveEvent = CreateEvent(NULL, 1, 0, NULL);
+
+    HWAVEOUT hWaveOut;
+    waveOutOpen(&hWaveOut, WAVE_MAPPER, &format, (DWORD_PTR) waveEvent, 0, CALLBACK_EVENT);
+
+    for (size_t i = 0; i < 4; i++) {
+        int16_t audio_buffers[4][AUDIO_BUFFER_LENGTH * 2];
+        waveHeaders[i] = {
+            .lpData = (char *) audio_buffers[i],
+            .dwBufferLength = AUDIO_BUFFER_LENGTH * 2,
+        };
+        waveOutPrepareHeader(hWaveOut, &waveHeaders[i], sizeof(WAVEHDR));
+        waveHeaders[i].dwFlags |= WHDR_DONE;
+    }
+    WAVEHDR *currentHeader = waveHeaders;
+
+
+    while (1) {
+        if (WaitForSingleObject(waveEvent, INFINITE)) {
+            //            fprintf(stderr, "Failed to wait for event.\n");
+            return 1;
+        }
+
+        if (!ResetEvent(waveEvent)) {
+            //            fprintf(stderr, "Failed to reset event.\n");
+            return 1;
+        }
+
+        // Wait until audio finishes playing
+        while (currentHeader->dwFlags & WHDR_DONE) {
+            WaitForSingleObject(updateEvent, INFINITE);
+            ResetEvent(updateEvent);
+            //            PSG_calc_stereo(&psg, audiobuffer, AUDIO_BUFFER_LENGTH);
+            memcpy(currentHeader->lpData, audio_buffer, AUDIO_BUFFER_LENGTH * 2);
+            waveOutWrite(hWaveOut, currentHeader, sizeof(WAVEHDR));
+            //waveOutPrepareHeader(hWaveOut, currentHeader, sizeof(WAVEHDR));
+            currentHeader++;
+            if (currentHeader == waveHeaders + 4) { currentHeader = waveHeaders; }
+        }
+    }
+    return 0;
+}
+
+DWORD WINAPI TicksThread(LPVOID lpParam) {
+    LARGE_INTEGER start, current, queryperf;
+
+
+    QueryPerformanceFrequency(&queryperf);
+    uint32_t hostfreq = (uint32_t) queryperf.QuadPart;
+
+    QueryPerformanceCounter(&start); // Get the starting time
+    uint32_t last_sound_tick = 0;
+
+
+    updateEvent = CreateEvent(NULL, 1, 1, NULL);
+    while (1) {
+        QueryPerformanceCounter(&current); // Get the current time
+
+        // Calculate elapsed time in ticks since the start
+        uint32_t elapsedTime = (uint32_t) (current.QuadPart - start.QuadPart);
+
+        if (elapsedTime - last_sound_tick >= hostfreq / SOUND_FREQUENCY) {
+            const int16_t sample =  sound_generate_sample();
+
+            audio_buffer[sample_index++] = sample;
+            audio_buffer[sample_index++] = sample;
+
+            if (sample_index >= AUDIO_BUFFER_LENGTH) {
+                SetEvent(updateEvent);
+                sample_index = 0;
+            }
+
+            last_sound_tick = elapsedTime;
+        }
+    }
+}
 
 extern "C" uint8_t Rd6502(uint16_t address) {
     if (address <= 0x1FFF) {
@@ -67,7 +165,7 @@ extern "C" uint8_t Rd6502(uint16_t address) {
 
     if (address == 0x2024) {
         printf("IRQ timer STATUS reset\n");
-        irq_enabled = false;
+        irq_timer_expired = true;
         return 1;
     }
 
@@ -92,9 +190,8 @@ extern "C" uint8_t Rd6502(uint16_t address) {
     T: IRQ Timer expired (1 = expired)
 */
     if (address == 0x2027) {
-        irq_enabled = false;
         printf("IRQ STATUS read\n");
-        return 0b11;
+        return irq_timer_expired;
     }
 
     if (address >= 0x2000 && address <= 0x2007) {
@@ -177,15 +274,9 @@ extern "C" void Wr6502(uint16_t address, uint8_t value) {
         return;
     }
 
-    if (address >= 0x2010 && address <= 0x201C) {
-//        printf("SOUND register write\n");
-        return;
-    }
+    if ((address >= 0x2010 && address <= 0x201C) || (address >= 0x2028 && address <= 0x202F)) {
 
-    if (address >= 0x2028 && address <= 0x202F) {
-//        printf("SOUND register 2  write\n");
-        // address & 4
-        return;
+        return sound_wave_write((address & 0x4) >> 2, address & 3, value);
     }
 /* IRQ Timer:
     7       0
@@ -201,11 +292,12 @@ extern "C" void Wr6502(uint16_t address, uint8_t value) {
     if (address == 0x2023) {
         irq_timer_counter = value;
 
-        if (value == 0 && irq_enabled)
+        if (value == 0) {
             Int6502(&cpu, INT_IRQ);
-
+            irq_timer_expired = true;
+        }
         printf("irq_timer_counter %d\n", value);
-        timer_prescaler = 256;
+//        timer_prescaler = 256;
         return;
     }
 
@@ -228,7 +320,7 @@ extern "C" void Wr6502(uint16_t address, uint8_t value) {
         nmi_enabled = 1 == (value & 1);
         irq_enabled = 2 == (value & 2);
         timer_prescaler = 1 == (value & 5) ? 16384 : 256;
-        printf("timer_prescaler irq_enabled nmi_enabled  %d %d %d\n", timer_prescaler, irq_enabled, nmi_enabled);
+        printf("timer_prescaler irq_enabled nmi_enabled  %d %d %d 0x%02x\n", timer_prescaler, irq_enabled, nmi_enabled, value);
         return;
     }
 
@@ -240,81 +332,27 @@ extern "C" void Wr6502(uint16_t address, uint8_t value) {
     printf("WRITE >>>>>>>>> 0x%04x : 0x%02x PC:%04x\r\n", address, value, cpu.PC.W);
 }
 
-#define AUDIO_FREQ 44100
-#define AUDIO_BUFFER_LENGTH ((AUDIO_FREQ /60 +1) * 2)
-
-int16_t audiobuffer[AUDIO_BUFFER_LENGTH] = { 0 };
-
-DWORD WINAPI SoundThread(LPVOID lpParam) {
-    WAVEHDR waveHeaders[4];
-
-    WAVEFORMATEX format = { 0 };
-    format.wFormatTag = WAVE_FORMAT_PCM;
-    format.nChannels = 2;
-    format.nSamplesPerSec = AUDIO_FREQ;
-    format.wBitsPerSample = 16;
-    format.nBlockAlign = format.nChannels * format.wBitsPerSample / 8;
-    format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
-
-    HANDLE waveEvent = CreateEvent(NULL, 1, 0, NULL);
-
-    HWAVEOUT hWaveOut;
-    waveOutOpen(&hWaveOut, WAVE_MAPPER, &format, (DWORD_PTR) waveEvent, 0, CALLBACK_EVENT);
-
-    for (size_t i = 0; i < 4; i++) {
-        int16_t audio_buffers[4][AUDIO_BUFFER_LENGTH * 2];
-        waveHeaders[i] = {
-                .lpData = (char *) audio_buffers[i],
-                .dwBufferLength = AUDIO_BUFFER_LENGTH * 2,
-        };
-        waveOutPrepareHeader(hWaveOut, &waveHeaders[i], sizeof(WAVEHDR));
-        waveHeaders[i].dwFlags |= WHDR_DONE;
-    }
-    WAVEHDR *currentHeader = waveHeaders;
-
-
-    while (true) {
-        if (WaitForSingleObject(waveEvent, INFINITE)) {
-            fprintf(stderr, "Failed to wait for event.\n");
-            return 1;
-        }
-
-        if (!ResetEvent(waveEvent)) {
-            fprintf(stderr, "Failed to reset event.\n");
-            return 1;
-        }
-
-// Wait until audio finishes playing
-        while (currentHeader->dwFlags & WHDR_DONE) {
-            //PSG_calc_stereo(&psg, audiobuffer, AUDIO_BUFFER_LENGTH);
-            memcpy(currentHeader->lpData, audiobuffer, AUDIO_BUFFER_LENGTH * 2);
-            waveOutWrite(hWaveOut, currentHeader, sizeof(WAVEHDR));
-
-            currentHeader++;
-            if (currentHeader == waveHeaders + 4) { currentHeader = waveHeaders; }
-        }
-    }
-    return 0;
-}
-
 extern "C" byte Loop6502(M6502 *R) {
     static int timer = 0;
 
-    if (irq_enabled && irq_timer_counter == 0) {
+    if (!irq_timer_expired && irq_timer_counter == 0) {
         printf("Counter expired, IRQ\n");
-        irq_enabled = 0;
+        irq_timer_expired = true;
         return INT_IRQ;
     }
 
     if (timer_prescaler == 256) {
         irq_timer_counter--;
+        // printf("irq_timer_counter tick %i\n", irq_timer_counter);
     } else {
         timer += 256;
         if (timer == timer_prescaler) {
             irq_timer_counter--;
+            // printf("irq_timer_counter tick %i\n", irq_timer_counter);
             timer = 0;
         }
     }
+
     return INT_QUIT;
 }
 
@@ -340,41 +378,44 @@ int main(int argc, char **argv) {
         return 0;
 
     CreateThread(NULL, 0, SoundThread, NULL, 0, NULL);
+    CreateThread(NULL, 0, TicksThread, NULL, 0, NULL);
 
     readfile(argv[1], ROM);
     memset(VRAM, 0x00, sizeof(VRAM));
     memset(RAM, 0x00, sizeof(RAM));
     Reset6502(&cpu);
-
     cpu.IPeriod = 256;
-
     for (;;) {
         for (int i = 0; i < 256; i++) {
             Run6502(&cpu);
 
-            auto *screen = (uint16_t *) &SCREEN;
-            int offset = lcd_registers[2] / 4 + lcd_registers[3] * 0x30;
+            /* render scanline */
+            {
+                auto *screen = (uint16_t *) &SCREEN;
+                int offset = lcd_registers[2] / 4 + lcd_registers[3] * 0x30;
 
-            for (int y = 0; y < WATARA_SCREEN_HEIGHT; y++) {
-                auto *vram_line = VRAM + offset;
-                uint8_t pixel = *vram_line++;
+                for (int y = 0; y < WATARA_SCREEN_HEIGHT; y++) {
+                    auto *vram_line = VRAM + offset;
+                    uint8_t pixel = *vram_line++;
 
-                for (int x = 0; x < 160;) {
-                    screen[x++] = watara_palette[pixel & 3];
-                    pixel >>= 2;
-                    screen[x++] = watara_palette[pixel & 3];
-                    pixel >>= 2;
-                    screen[x++] = watara_palette[pixel & 3];
-                    pixel >>= 2;
-                    screen[x++] = watara_palette[pixel & 3];
+                    for (int x = lcd_registers[2] & 3; x < lcd_registers[0];) {
+                        screen[x++] = watara_palette[pixel & 3];
+                        pixel >>= 2;
+                        screen[x++] = watara_palette[pixel & 3];
+                        pixel >>= 2;
+                        screen[x++] = watara_palette[pixel & 3];
+                        pixel >>= 2;
+                        screen[x++] = watara_palette[pixel & 3];
 
-                    pixel = *vram_line++;
+                        pixel = *vram_line++;
+                    }
+                    screen += 160;
+                    offset += 0x30;
                 }
-                screen += 160;
-                offset += 0x30;
             }
         }
 
+        // The NMI occurs every 65536 clock cycles (61.04Hz) regardless of the rate that the LCD refreshes.
         if (nmi_enabled)
             Int6502(&cpu, INT_NMI);
 
