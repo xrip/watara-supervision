@@ -274,9 +274,18 @@ extern "C" void Wr6502(uint16_t address, uint8_t value) {
         return;
     }
 
-    if ((address >= 0x2010 && address <= 0x201C) || (address >= 0x2028 && address <= 0x202F)) {
+    if ((address >= 0x2010 && address <= 0x2017)) {
 
         return sound_wave_write((address & 0x4) >> 2, address & 3, value);
+    }
+
+    if (address >= 0x2018 && address <= 0x201C) {
+        // dma
+        return;
+    }
+
+    if ((address >= 0x2028 && address <= 0x202F)) {
+        return sound_noise_write(address & 3, value);
     }
 /* IRQ Timer:
     7       0
@@ -384,6 +393,9 @@ int main(int argc, char **argv) {
     memset(VRAM, 0x00, sizeof(VRAM));
     memset(RAM, 0x00, sizeof(RAM));
     Reset6502(&cpu);
+
+    sound_init();
+
     cpu.IPeriod = 256;
     for (;;) {
         for (int i = 0; i < 256; i++) {
