@@ -1,6 +1,8 @@
 #ifndef SOUND_H
 #define SOUND_H
 
+extern "C" uint8_t Rd6502(uint16_t address);
+
 #define UNSCALED_CLOCK 4000000
 #define SAMPLE_RATE 44100
 
@@ -47,17 +49,42 @@ typedef struct {
     uint16_t lfsr; // Linear feedback shift register for noise generation
 } SV_NOISE_CHANNEL;
 
+// DMA Channel for digitized audio
+typedef struct {
+    // Registers
+    uint8_t reg[5]; // Raw register values (CH3_Addrlow, CH3_Addrehi, CH3_Length, CH3_Control, CH3_Trigger)
+    uint16_t address; // Start address of sample data in ROM
+    uint8_t length;   // Length of sample (length * 16 bytes)
+    uint8_t rom_bank; // ROM bank for sample data (0-7)
+
+    // Control flags
+    bool left_output;  // Output to left channel
+    bool right_output; // Output to right channel
+    uint8_t frequency; // Playback frequency setting (0-3)
+    bool triggered;    // Channel triggered flag
+
+    // Internal state
+    uint16_t current_address; // Current read address
+    uint8_t current_byte;     // Current byte being processed
+    bool high_nibble;         // Currently outputting high or low nibble
+    uint16_t position;        // Sample position counter
+    uint16_t samples_played;  // Number of samples played so far
+    uint16_t clock_divisor;   // Clock cycles per sample output
+} SV_DMA_CHANNEL;
+
 // Global state
 static SV_CHANNEL channels[2];
 static SV_NOISE_CHANNEL noise_channel;
+static SV_DMA_CHANNEL dma_channel;
 
 // Function to initialize the sound system
 inline void sound_init() {
     memset(channels, 0, sizeof(channels));
     memset(&noise_channel, 0, sizeof(noise_channel));
+    memset(&dma_channel, 0, sizeof(dma_channel));
 
-    // Initialize LFSR with non-zero value to avoid getting stuck
-    noise_channel.lfsr = 0x7FFF;
+    // Initialize LFSR with all bits set to 1
+    noise_channel.lfsr = 0x7FFF; // 15-bit value (all 1s)
 
     // Default the divisor to something reasonable
     noise_channel.divisor = 8;
@@ -160,6 +187,71 @@ inline void sound_noise_write(const int reg_index, const uint8_t value) {
 
             // Reset position counter
             noise_channel.position = 0;
+            break;
+        }
+    }
+}
+
+// Register write handler for DMA channel
+inline void sound_dma_write(const int reg_index, const uint8_t value) {
+
+    dma_channel.reg[reg_index] = value;
+
+    switch (reg_index) {
+        case 0: { // CH3_Addrlow - Low byte of address
+            dma_channel.address = (dma_channel.address & 0xFF00) | value;
+            break;
+        }
+
+        case 1: { // CH3_Addrehi - High byte of address
+            dma_channel.address = (dma_channel.address & 0x00FF) | (value << 8);
+            break;
+        }
+
+        case 2: { // CH3_Length - Length of sample
+            dma_channel.length = value;
+            break;
+        }
+
+        case 3: { // CH3_Control - Control settings
+            // Parse ROM bank and output flags
+            dma_channel.rom_bank = (value & 0x70) >> 4;  // Bits 4-6: ROM bank (0-7)
+            dma_channel.left_output = (value & 0x04) != 0;  // Bit 2: Output to left
+            dma_channel.right_output = (value & 0x02) != 0; // Bit 1: Output to right
+            dma_channel.frequency = value & 0x03;          // Bits 0-1: Frequency
+
+            // Set clock divisor based on frequency setting
+            static constexpr uint16_t divisors[4] = {
+                256,  // 00 - 256 clocks
+                512,  // 01 - 512 clocks
+                1024, // 10 - 1024 clocks
+                2048  // 11 - 2048 clocks
+            };
+            dma_channel.clock_divisor = divisors[dma_channel.frequency];
+            break;
+        }
+
+        case 4: { // CH3_Trigger - Trigger playback
+            // Check if bit 7 is set to trigger playback
+            if (value & 0x80) {
+                dma_channel.triggered = true;
+
+                // If this is a fresh trigger (not already playing), initialize playback state
+                if (dma_channel.samples_played == 0) {
+                    // Set current address to start address
+                    dma_channel.current_address = dma_channel.address;
+                    // Reset sample counters
+                    dma_channel.samples_played = 0;
+                    dma_channel.position = 0;
+                    dma_channel.high_nibble = true; // Start with high nibble
+
+                    // Load first byte
+                    dma_channel.current_byte = Rd6502(dma_channel.current_address);
+                        //read_rom_byte(dma_channel.rom_bank, dma_channel.current_address);
+                }
+            } else {
+                dma_channel.triggered = false;
+            }
             break;
         }
     }
@@ -283,6 +375,45 @@ inline int16_t sound_generate_sample() {
             }
         }
     }
+
+
+    if (dma_channel.triggered) {
+        // Calculate total sample length in bytes
+        uint16_t total_bytes = (dma_channel.length == 0) ? 4096 : (dma_channel.length * 16);
+        uint16_t total_samples = total_bytes * 2; // Each byte provides 2 samples (high and low nibbles)
+
+        // Check if we've reached the end of the sample
+        if (dma_channel.samples_played >= total_samples) {
+            // Sample playback complete
+            dma_channel.triggered = false;
+            return 0;
+        }
+
+        // Process current sample
+        if (dma_channel.high_nibble) {
+            // Output high nibble (bits 4-7)
+            final_output = (dma_channel.current_byte >> 4) & 0x0F;
+        } else {
+            // Output low nibble (bits 0-3)
+            final_output = dma_channel.current_byte & 0x0F;
+
+            // After processing low nibble, advance to next byte
+            dma_channel.current_address++;
+            printf("dma read\n");
+            dma_channel.current_byte = Rd6502(dma_channel.current_address);
+            // dma_channel.current_byte = read_rom_byte(dma_channel.rom_bank, dma_channel.current_address);
+        }
+
+        // Alternate between high and low nibble
+        dma_channel.high_nibble = !dma_channel.high_nibble;
+
+        // Increment samples played counter
+        dma_channel.samples_played++;
+    }
+
+    // Average the left and right channels for final output
+    // (This can be modified if stereo output is desired)
+    final_output += (left_output + right_output) / 2;
 
 
 

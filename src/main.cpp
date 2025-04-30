@@ -280,12 +280,17 @@ extern "C" void Wr6502(uint16_t address, uint8_t value) {
     }
 
     if (address >= 0x2018 && address <= 0x201C) {
-        // dma
-        return;
+
+        return sound_dma_write(address - 0x2018, value);
     }
 
-    if ((address >= 0x2028 && address <= 0x202F)) {
-        return sound_noise_write(address & 3, value);
+    if ((address >= 0x2028 && address <= 0x202A)) {
+        return sound_noise_write(address - 0x2028, value);
+    }
+
+
+    if ((address >= 0x202C && address <= 0x202E)) {
+        return sound_noise_write(address - 0x202C, value);
     }
 /* IRQ Timer:
     7       0
